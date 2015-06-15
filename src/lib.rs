@@ -16,12 +16,14 @@ use bincode::SizeLimit;
 use rustc_serialize::json;
 use rustc_serialize::base64;
 use rustc_serialize::base64::{ToBase64, FromBase64};
+use rustc_serialize::{Encodable, Decodable};
 
 trait DBVariable {
 	/// Loads the variable instance from the database file
-	fn load(&mut self, instance_id: usize) -> Result<&Self, String> {
+	fn load<T>(var: T, instance_id: usize) -> Result<T, String> where T: DBVariable + Decodable {
+		let filename = format!("database/{}_{}.db", var.name(), instance_id);		
 		let mut options = OpenOptions::new();
-		let path = Path::new(&format!("database/{}_{}.db", self.name(), instance_id));
+		let path = Path::new(&filename);
 
 		let mut file = match options.open(path) {
 			Ok(file) => file,
@@ -35,18 +37,35 @@ trait DBVariable {
 			_ => ()
 		}
 
-		let decoded = match bincode::decode(&data.as_bytes()) {
+		let decoded: T = match bincode::decode(&data.as_bytes()) {
 			Ok(d) => d,
-			Err(e) => 
+			Err(e) => T::new()
 		};
-		Ok(self)
+		Ok(decoded)
 	}
 	
 	/// Saves the struct data into the variable instance in the database file.
-	fn save(&self) -> Result<&Self, String> {
-		Ok(self)
+	fn save<T>(var: T, instance_id: usize) -> Result<(), String> where T: DBVariable + Encodable {
+		let filename = format!("database/{}_{}.db", var.name(), instance_id);		
+		let path = Path::new(&filename);
+
+		let mut file = match File::create(path) {
+			Ok(file) => file,
+			Err(error)  => panic!("Could not open file: {}", error)
+		};
+	
+		// save definitions back to file
+		match bincode::encode_into(&var, &mut file, bincode::SizeLimit::Infinite) {
+			Ok(d) => d,
+			Err(e) => panic!("{}", e)
+		};
+	
+		Ok(())
 	}
 
+
+	fn new() -> Self;
+	
 	/// Returns the name of the variable
 	fn name(&self) -> &'static str;
 }
@@ -70,7 +89,7 @@ impl Instance {
 			panic!("No definition for resource: {}", resource_name);
 		}
 
-		let references = resource_def.variables_referenced;
+		let references = &resource_def.unwrap().variables_referenced;
 
 		// open each variable file and find each instance
 		for reference in references {
