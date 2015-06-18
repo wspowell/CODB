@@ -1,246 +1,211 @@
+#![allow(dead_code)]
+#![allow(unused_must_use)]
+
 extern crate rustc_serialize;
 extern crate bincode;
 
-use std::fs;
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::io::{BufReader};
-use std::io::prelude::*;
-use std::os::unix;
-use std::path::Path;
+use rustc_serialize::{Encodable};
 
-use std::collections::HashMap;
+mod db {
+	extern crate rustc_serialize;
+	extern crate bincode;
+	use std::collections::{HashMap};
 
-use bincode::SizeLimit;
+	use std::fs;
+	use std::fs::{File};
+	use std::io::{BufReader};
+	use std::path::Path;
 
-use rustc_serialize::json;
-use rustc_serialize::base64;
-use rustc_serialize::base64::{ToBase64, FromBase64};
-use rustc_serialize::{Encodable, Decodable};
+	use rustc_serialize::{Encodable, Decodable};
 
-trait DBVariable {
-	/// Loads the variable instance from the database file
-	fn load<T>(var: T, instance_id: usize) -> Result<T, String> where T: DBVariable + Decodable {
-		let filename = format!("database/{}_{}.db", var.name(), instance_id);		
-		let mut options = OpenOptions::new();
-		let path = Path::new(&filename);
+	use bincode::SizeLimit;
 
-		let mut file = match options.open(path) {
+	// TODO: return an error instead of panicing
+	fn load_from_file<T>(directory: &str, filename: &str) -> T where T: Decodable {
+		let dir_and_filename = format!("{}{}", directory, filename);
+		
+		let path = Path::new(&dir_and_filename);
+
+		let file = match File::open(path) {
 			Ok(file) => file,
 			Err(error)  => panic!("Could not open file: {}", error)
 		};
 
-		// Read the file contents into a string
-		let mut data = String::new();
-		match file.read_to_string(&mut data) {
-			Err(error) => panic!("Could not open file: {}", error),
-			_ => ()
-		}
+		// TODO: check if empty, if so then do something useful
+		let mut reader = BufReader::new(&file);
 
-		let decoded: T = match bincode::decode(&data.as_bytes()) {
-			Ok(d) => d,
-			Err(e) => T::new()
-		};
-		Ok(decoded)
+		match bincode::decode_from(&mut reader, bincode::SizeLimit::Infinite) {
+			Ok(value) => value,
+			Err(error) => panic!("Could not load file, {}: {}", filename, error)
+		}
 	}
-	
-	/// Saves the struct data into the variable instance in the database file.
-	fn save<T>(var: T, instance_id: usize) -> Result<(), String> where T: DBVariable + Encodable {
-		let filename = format!("database/{}_{}.db", var.name(), instance_id);		
-		let path = Path::new(&filename);
+
+	// TODO: return an error instead of panicing
+	fn save_to_file<T>(directory: &str, filename: &str, value: &T) where T: Encodable {	
+		let dir_and_filename = format!("{}{}", directory, filename);
+		
+		let path = Path::new(&dir_and_filename);
+		
+		// FIXME: PathExt is unstable, grrrrr
+		//if !path.is_dir() {
+			fs::create_dir(directory); // ignore the return until PathExt is stable
+		//}
+
+		// FIXME: PathExt is unstable, grrrrr
+		//if !path.is_file() {
+			create_file(&path);
+		//}
 
 		let mut file = match File::create(path) {
 			Ok(file) => file,
-			Err(error)  => panic!("Could not open file: {}", error)
+			Err(error) => panic!("Could not open file, {}: {}", filename, error)
 		};
-	
+
 		// save definitions back to file
-		match bincode::encode_into(&var, &mut file, bincode::SizeLimit::Infinite) {
-			Ok(d) => d,
-			Err(e) => panic!("{}", e)
-		};
-	
-		Ok(())
-	}
-
-
-	fn new() -> Self;
-	
-	/// Returns the name of the variable
-	fn name(&self) -> &'static str;
-}
-
-/// The Instance is filled with data given a resource name and instance id.
-struct Instance {
-	data: HashMap<String, Box<DBVariable>>
-}
-
-impl Instance {
-	fn new(resource_name: &str, instance_id: usize) -> Result<Instance, String> {
-		let mut data: HashMap<String, Box<DBVariable>> = HashMap::new();
-
-		// open resource definition file
-		let definitions = ResourceDefinition::read();		
-
-		// get variable IDs associated with the resource
-		let resource_def = definitions.get(resource_name);
-
-		if resource_def == None {
-			panic!("No definition for resource: {}", resource_name);
-		}
-
-		let references = &resource_def.unwrap().variables_referenced;
-
-		// open each variable file and find each instance
-		for reference in references {
-			
-		}
-
-		Ok(Instance {
-			data: data
-		})
-	}
-}
-
-#[derive(RustcDecodable, RustcEncodable, PartialEq)]
-struct ResourceDefinition {
-	resource_name: String,
-	variables_referenced: Vec<String>
-}
-
-impl ResourceDefinition {
-	pub fn read() -> HashMap<String, ResourceDefinition> {
-		let mut options = OpenOptions::new();
-		let path = Path::new("database/resource_definition.db");
-
-		let mut file = match options.open(path) {
-			Ok(file) => file,
-			Err(error)  => panic!("Could not open file: {}", error)
-		};
-
-		// Read the file contents into a string
-		let mut data = String::new();
-		match file.read_to_string(&mut data) {
-			Err(error) => panic!("Could not open file: {}", error),
+		match bincode::encode_into(&value, &mut file, bincode::SizeLimit::Infinite) {
+			Err(error) => panic!("Could not save to file, {}: {}", filename, error),
 			_ => ()
+		};
+	}
+
+	// TODO: return an error instead of panicing
+	fn create_file(path: &Path) {
+		match File::create(path) {
+			Ok(file) => file,
+			Err(error) => panic!("Could not open file: {}", error)
+		};
+	}
+
+	// TODO: return an error instead of panicing
+	fn encode<T>(value: &T) -> Vec<u8> where T: Encodable {
+		bincode::encode(&value, SizeLimit::Infinite).unwrap_or(panic!("Could not encode Value<T>."))
+	}
+
+	// TODO: return an error instead of panicing
+	fn decode<T>(encoded: &Vec<u8>) -> T where T: Decodable {
+		bincode::decode(&encoded[..]).unwrap_or(panic!("Could not decode to Value<T>."))
+	}
+
+	#[derive(RustcEncodable, RustcDecodable, PartialEq)]
+	pub struct Layout {
+		version : usize, // version of the database
+		resources: HashMap<String, usize>, // resource name : resource id 
+		resource_models: HashMap<usize, Vec<usize>>, // resource id : list of variable ids
+		resource_instances: HashMap<usize, Vec<usize>>, // resource id : list of instances (if no resource id is in the map then it is treated as a single page, ex /login/)
+		
+		/// The InstanceTypes are defined by the user and therefore, it is left up
+		/// to the user to properly version each instance_type and migrate from one to
+		/// the next. Each InstanceType has an ID which is used as the key and a
+		/// version ID which is used to keep different versions/types separate.
+		/// The instance ID is used to look up the file where the data lies. This 
+		/// is by convention defined in the API (not by the user) and could be something like 
+		/// /data/instance_types/[instance_type_id]/[version_id]/[instance_id].dat
+		instance_type: HashMap<usize, HashMap<usize, usize>> // instance_type id : [version id : instance id]
+	}
+
+	impl Layout {
+		pub fn init() {
+			fs::create_dir("data/"); // ignore result until PathExt is stable
+			fs::create_dir("data/layout/"); // ignore result until PathExt is stable
+			fs::create_dir("data/instance_types/"); // ignore result until PathExt is stable
+
+			let init_layout = Layout {
+				version: 0,
+				resources: HashMap::new(),
+				resource_models: HashMap::new(),
+				resource_instances: HashMap::new(),
+				instance_type: HashMap::new()
+			};	
+
+			save_to_file::<Layout>("data/layout/", "layout.dat", &init_layout);
 		}
 
-		let decoded: HashMap<String, ResourceDefinition> = match bincode::decode(&data.as_bytes()) {
-			Ok(d) => d,
-			Err(e) => HashMap::new() // FIXME: could potentially lose all data if error occurs
-		};
-		decoded
-	}
-
-	fn write(definitions: &HashMap<String, ResourceDefinition>) {
-		//let mut options = OpenOptions::new();
-		//options.write(true).append(false);
-		let path = Path::new("database/resource_definition.db");
-
-		let mut file = match File::create(path) {
-			Ok(file) => file,
-			Err(error)  => panic!("Could not open file: {}", error)
-		};
+		pub fn load() -> Layout {
+			load_from_file::<Layout>("data/layout/", "layout.dat")
+		}
+		
+		pub fn save(&self) {
+			save_to_file("data/layout/", "layout.dat", &self);
+		}
 	
-		// save definitions back to file
-		match bincode::encode_into(&definitions, &mut file, bincode::SizeLimit::Infinite) {
-			Ok(d) => d,
-			Err(e) => panic!("{}", e)
-		};
+		//pub fn add_resource(
+	}
+	
+
+	/// Defines one variable (or "bucket") in which instances will be placed 
+	/// Each InstanceType must know how to encode its value and where the instances live
+	pub trait InstanceType: Encodable + Decodable + PartialEq {
+		fn instance_id(&self) -> usize;
+		fn instance_type_id() -> &'static usize;
+		fn version(&self) -> &'static usize;
+		fn migrate(migration: &'static (&'static usize, &'static usize, fn())) {
+		    migration.2();
+		}
 	}
 
-	pub fn add(definition: ResourceDefinition) {
-		// get the previous definitions
-		let mut definitions = ResourceDefinition::read();
-		// add/edit new definition
-		definitions.insert(definition.resource_name.to_string(), definition); 
-		// save definitions back to file
-		ResourceDefinition::write(&definitions);
+	// TODO: return an error instead of panicing
+	pub fn load_instance<T>(instance_id: usize) -> T where T: InstanceType {
+		let directory = format!("data/instance_types/{}/", T::instance_type_id());
+		let filename = format!("{}.dat", instance_id);
+
+		load_from_file(&directory, &filename)
 	}
 
-	pub fn remove(resource_name: &str) {
-		// get the previous definitions
-		let mut definitions = ResourceDefinition::read();
-		// add/edit new definition
-		definitions.remove(resource_name); 
-		// save definitions back to file
-		ResourceDefinition::write(&definitions);
+	// TODO: return an error instead of panicing
+	pub fn save_instance<T>(instance: &T) where T: InstanceType {
+		let directory = format!("data/instance_types/{}/", T::instance_type_id());
+		let filename = format!("{}.dat", instance.instance_id());
+
+		save_to_file(&directory, &filename, &instance);
 	}
+
+	#[test]
+	fn test_db_init_load_save() {
+		Layout::init();
+		let mut layout: Layout = Layout::load();
+		assert_eq!(layout.version, 0);
+		layout.version = 1;
+		layout.save();
+	
+		let layout2: Layout = Layout::load();
+		assert_eq!(layout2.version, 1);
+	}
+}
+
+/// From here down it is user end code, above is the API interface
+
+#[derive(RustcEncodable, RustcDecodable, PartialEq)]
+struct Text {
+	instance_id: usize,
+	text: String
+}
+
+impl db::InstanceType for Text { 
+	fn instance_id(&self) -> usize {
+		self.instance_id
+	}
+
+    fn instance_type_id() -> &'static usize {
+        static ID: &'static usize = &0;
+        ID
+    }
+    
+    fn version(&self) -> &'static usize {
+        static VERSION: &'static usize = &0;
+        VERSION
+    }
 }
 
 #[test]
-fn test_resource_definition() {
-	let mut variables_referenced: Vec<String> = Vec::new();
-	variables_referenced.push("username".to_string());
-	variables_referenced.push("password".to_string());
-	let login = ResourceDefinition {
-		resource_name: "login".to_string(),
-		variables_referenced: variables_referenced
+fn test_instance() {
+	let instance = Text {
+		instance_id: 0,
+		text: "Hello, world!".to_string()
 	};
-
-	let mut variables_referenced2: Vec<String> = Vec::new();
-	variables_referenced2.push("resource_name".to_string());
-	variables_referenced2.push("variables_referenced".to_string());
-	let sw_admin = ResourceDefinition {
-		resource_name: "sw_admin".to_string(),
-		variables_referenced: variables_referenced2
-	};
-
-	ResourceDefinition::add(login);
-	ResourceDefinition::add(sw_admin);
-
-	assert!(ResourceDefinition::read().contains_key("login"));
-	assert!(ResourceDefinition::read().contains_key("sw_admin"));
-
-	ResourceDefinition::remove("login");
-	ResourceDefinition::remove("sw_admin");
-
-	assert!(!ResourceDefinition::read().contains_key("login"));
-	assert!(!ResourceDefinition::read().contains_key("sw_admin"));
-}
-
-/*
-#[test]
-fn it_works() {
-	let object: TestStruct = TestStruct {
-        data_int: 1,
-        data_str: "homura".to_string(),
-        data_vector: vec![2,3,4,5],
-    };
-
-	let object2: TestStruct2 = TestStruct2 {
-		data_int: 1,
-        data_str: "homura".to_string(),
-        data_vector: vec![2,3,4,5],
-    };
-
-	println!("{} {}", object.name(), object2.name());
 	
-
-	// Serialize using `json::encode`
-    let encoded = json::encode(&object).unwrap();
-
-	println!("{:?}", encoded);
-
-    // Deserialize using `json::decode`
-
-	let json = "{\"data_int\":\"1\",\"data_str\":\"homura\",\"data_vector\":[2,3,4,5]}";
-
-    let decoded: TestStruct = json::decode(&json).unwrap();
-
-	let encoded2 = json::encode(&decoded).unwrap();
-
-	println!("{:?}", encoded2);
-
-
-	let bin_encoded: Vec<u8> = bincode::encode(&object, SizeLimit::Infinite).unwrap();
-
-    println!("{:?}", bin_encoded);
-
-    let bin_decoded: TestStruct = bincode::decode(&bin_encoded[..]).unwrap();
-
-    assert!(object == bin_decoded);
+	db::save_instance(&instance);
+	
+	let loaded: Text = db::load_instance(0);
+	assert_eq!(instance.text, loaded.text);
 }
-*/
-
 
