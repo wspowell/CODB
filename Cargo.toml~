@@ -1,8 +1,0 @@
-[package]
-name = "CODB"
-version = "0.1.0"
-authors = ["Wesley Powell <wspowell@utexas.edu>"]
-
-[dependencies]
-rustc-serialize = "0.3.15"
-bincode = "0.3.0"
