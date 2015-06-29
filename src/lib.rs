@@ -5,9 +5,11 @@ extern crate regex;
 extern crate rustc_serialize;
 extern crate bincode;
 
+use std::collections::{HashMap, HashSet};
+
 mod db {
 	use std::path::Path;
-	use std::collections::{HashMap};
+	use std::collections::{HashMap, HashSet};
 	use std::fs;
 	use std::fs::{File, OpenOptions};
 	use std::io::{BufReader, ErrorKind};
@@ -26,10 +28,14 @@ mod db {
 		CouldNotOpenFile(String),
 		CouldNotCreateFile(String),
 		CouldNotCreateDirectory(String),
+		ComponentNotDefined(String),
+		ResourceNotDefined(String),
+		InstanceNotDefined(String),
+		MalformedStructure(String)
 	}
 
 	#[derive(RustcEncodable, RustcDecodable, Debug, PartialEq)]
-	enum Data {
+	pub enum Data {
 		BOOL(bool),
 		CHAR(char),
 		SIGNED_INT_8(i8),
@@ -45,15 +51,35 @@ mod db {
 		STRING(String)
 	}
 
-	#[derive(RustcEncodable, RustcDecodable, Debug, PartialEq)]
-	enum TypeId {
+	impl Data {
+		fn copy(&self) -> Data {
+			match self {
+				&Data::BOOL(d) => Data::BOOL(d),
+				&Data::CHAR(d) => Data::CHAR(d),
+				&Data::SIGNED_INT_8(d) => Data::SIGNED_INT_8(d),
+				&Data::SIGNED_INT_16(d) => Data::SIGNED_INT_16(d),
+				&Data::SIGNED_INT_32(d) => Data::SIGNED_INT_32(d),
+				&Data::SIGNED_INT_64(d) => Data::SIGNED_INT_64(d),
+				&Data::UNSIGNED_INT_8(d) => Data::UNSIGNED_INT_8(d),
+				&Data::UNSIGNED_INT_16(d) => Data::UNSIGNED_INT_16(d),
+				&Data::UNSIGNED_INT_32(d) => Data::UNSIGNED_INT_32(d),
+				&Data::UNSIGNED_INT_64(d) => Data::UNSIGNED_INT_64(d),
+				&Data::FLOAT_32(d) => Data::FLOAT_32(d),
+				&Data::FLOAT_64(d) => Data::FLOAT_64(d),
+				&Data::STRING(ref d) => Data::STRING(d.to_string())
+			}
+		}
+	}
+
+	#[derive(RustcEncodable, RustcDecodable, Copy, Clone, Debug, PartialEq)]
+	pub enum TypeId {
 		UINT,
 		INT,
 		STRING
 	}
 
 	#[derive(Debug)]
-	enum IOType {
+	pub enum IOType {
 		OUTPUT,
 		INPUT,
 		BOTH
@@ -90,34 +116,103 @@ mod db {
 		
 	}
 
+	#[derive(Debug, PartialEq)]
+	pub struct ComponentInstance {
+		pub instance_id: usize,
+		pub component_id: usize,
+		pub component_name: String,
+		pub component_type: TypeId,
+		pub is_static_component: bool,
+		pub data: Data
+	}
+
+	// Admin functions
+
 	pub fn reset() -> DBResult<()> {
 		try!(internals::start_from_scratch());
 		Ok(())
 	}
 
-	fn add_resource(resource_name: &str) -> DBResult<()> {
+	pub fn add_resource(resource_name: &str, is_static: bool) -> DBResult<()> {
+		let mut resources = try!(internals::Resources::load());
+		let mut instances = try!(internals::Instances::load());
+
+		let instance_id = instances.next_instance_id;
+		instances.next_instance_id = instances.next_instance_id + 1;
+		try!(instances.save());
+
+		// add resource definition
+		let resource_id = resources.next_resource_id;
+		resources.next_resource_id = resources.next_resource_id + 1;
+		resources.resources.insert(resource_name.to_string(), (resource_id, is_static, instance_id));
+
+		// add model definition
+		resources.models.insert(resource_id, HashSet::new());
+
+		// save changes
+		try!(resources.save());
+
 		Ok(())
 	}
 
-	fn add_component(component_name: &str, type_id: TypeId) -> DBResult<()> {
+	pub fn add_component(component_name: &str, type_id: TypeId, is_static: bool) -> DBResult<()> {
+		let mut components = try!(internals::Components::load());
+
+		// add component definition
+		let component_id = components.next_component_id;
+		components.next_component_id = components.next_component_id + 1;
+		components.components.insert(component_name.to_string(), component_id);
+		components.component_names.insert(component_id, component_name.to_string());
+
+		// add type
+		components.component_types.insert(component_id, type_id);
+
+		// add static flag
+		components.component_static_flags.insert(component_id, is_static);
+
+		// save changes
+		try!(components.save());
+
 		Ok(())
 	}
 
-	fn add_component_to_model(resource_name: &str, component_name: &str, io_type: IOType) -> DBResult<()> {
+	pub fn add_component_to_model(resource_name: &str, component_name: &str, io_type: IOType) -> DBResult<()> {
+		let mut resources = try!(internals::Resources::load());
+		let components = try!(internals::Components::load());
+		let mut instances = try!(internals::Instances::load());
+		
+		// the resource must exist
+		if !resources.resources.contains_key(resource_name) {
+			return Err(DatabaseError::ResourceNotDefined(format!("Resource is not defined: {}", resource_name)));
+		}
+
+		// the component must exist
+		if !components.components.contains_key(component_name) {
+			return Err(DatabaseError::ComponentNotDefined(format!("Component is not defined: {}", component_name)));
+		}
+
+
+		let component_id = components.components.get(component_name).unwrap();
+		let resource_id = resources.resources.get(resource_name).unwrap().0;
+		{ // mutable scope for adding component id to resources
+			let mut model = resources.models.get_mut(&resource_id).unwrap();
+			model.insert(*component_id);
+		}
+
+		// add component instance to instances
+		if !instances.instances.contains_key(&component_id) {
+			// if no instances defined yet for component, then insert a new one
+			instances.instances.insert(*component_id, HashMap::new());
+			try!(instances.save());		
+		}
+
+		// save changes
+		try!(resources.save());
+
 		Ok(())
 	}
 
-	fn get_type_id(component_name: &str) -> DBResult<TypeId> {
-		Ok(TypeId::STRING)
-	}
-
-	fn load_model(resource_name: &str, instance_id: usize) -> DBResult<HashMap<String, Data>> {
-		Err(DatabaseError::GenericError)
-	}
-
-	fn save_model(model: HashMap<String, Data>, resource_name: &str, instance_id: usize) -> DBResult<()> {
-		Ok(())
-	}
+	// API helper functions
 
 	fn select(resource_name: &str, component_name: &str, instance_id: usize) -> DBResult<Data> {
 		Err(DatabaseError::GenericError)
@@ -134,12 +229,166 @@ mod db {
 		Ok(())
 	}
 
+	// API functions
+
+	pub fn get_type_id(component_name: &str) -> DBResult<TypeId> {
+		let components = try!(internals::Components::load());
+
+		// the component must exist
+		if !components.components.contains_key(component_name) {
+			return Err(DatabaseError::ComponentNotDefined(format!("Component is not defined: {}", component_name)));
+		}
+
+		// get component id
+		let component_id = components.components.get(component_name).unwrap();
+
+		// get type
+		let type_id: &TypeId = components.component_types.get(&component_id).unwrap();
+
+		// ?? done with Copy/Clone? Without Copy/Clone you cannot move this out of scope
+		Ok(*type_id)
+	}
+
+	pub fn is_static_resource(resource_name: &str) -> DBResult<bool> {
+		let resources = try!(internals::Resources::load());
+
+		// the resource must exist
+		if !resources.resources.contains_key(resource_name) {
+			return Err(DatabaseError::ResourceNotDefined(format!("Resource is not defined: {}", resource_name)));
+		}
+
+		// get static flag
+		let static_flag = resources.resources.get(resource_name).unwrap().1;
+
+		Ok(static_flag)
+	}
+
+	pub fn load_static_model(resource_name: &str) -> DBResult<HashMap<String, ComponentInstance>> {
+		let resources = try!(internals::Resources::load());
+		let components = try!(internals::Components::load());
+		let instances = try!(internals::Instances::load());
+
+		// the resource must exist
+		if !resources.resources.contains_key(resource_name) {
+			return Err(DatabaseError::ResourceNotDefined(format!("Resource is not defined: {}", resource_name)));
+		}
+
+		// the resource must be static
+		if !try!(is_static_resource(resource_name)) {
+			return Err(DatabaseError::MalformedStructure(format!("Resource is not static: {}", resource_name)));
+		}
+
+		// get resource id
+		let resource_id = resources.resources.get(resource_name).unwrap().0;
+		let static_resource_instance_id = resources.resources.get(resource_name).unwrap().2;
+
+		// get model
+		let mut model: HashMap<String, ComponentInstance> = HashMap::new();
+		let component_ids = resources.models.get(&resource_id).unwrap();
+		for component_id in component_ids {
+			println!("Getting component");
+			// get component data
+			let component_name = components.component_names.get(&component_id).unwrap();
+			let component_type = components.component_types.get(&component_id).unwrap();
+			let is_static = components.component_static_flags.get(&component_id).unwrap();
+			println!("Getting component data");
+			// get data
+			let data: Data = {
+				// instance data for component must exist
+				if !instances.instances.contains_key(&component_id) {
+					return Err(DatabaseError::InstanceNotDefined(format!("Instance is not defined for component: {}", component_name)));
+				}
+				println!("Checking");
+				// check if component data exists
+				if !instances.instances.get(&component_id).unwrap().contains_key(&static_resource_instance_id) {
+					println!("No data");
+					Data::STRING("".to_string())
+				} else {
+					println!("Has data");
+					match instances.instances.get(&component_id).unwrap().get(&static_resource_instance_id) {
+						Some(d) => d.copy(),
+						None => Data::STRING("".to_string())
+					}
+				}
+			};
+
+			let instance = ComponentInstance {
+				instance_id: static_resource_instance_id,
+				component_id: *component_id,
+				component_name: component_name.to_string(),
+				component_type: *component_type,
+				is_static_component: *is_static,
+				data: data
+			};
+
+			model.insert(component_name.to_string(), instance);
+		}
+
+		Ok(model)
+	}
+
+	pub fn load_model(resource_name: &str, instance_id: usize) -> DBResult<HashMap<String, ComponentInstance>> {
+		let resources = try!(internals::Resources::load());
+		let components = try!(internals::Components::load());
+		let instances = try!(internals::Instances::load());
+
+		// the resource must exist
+		if !resources.resources.contains_key(resource_name) {
+			return Err(DatabaseError::ResourceNotDefined(format!("Resource is not defined: {}", resource_name)));
+		}
+
+		// get resource id
+		let resource_id = resources.resources.get(resource_name).unwrap().0;
+
+		// get model
+		let mut model: HashMap<String, ComponentInstance> = HashMap::new();
+		let component_ids = resources.models.get(&resource_id).unwrap();
+		for component_id in component_ids {
+			// get component data
+			let component_name = components.component_names.get(&component_id).unwrap();
+			let component_type = components.component_types.get(&component_id).unwrap();
+			let is_static = components.component_static_flags.get(&component_id).unwrap();
+
+			// get data
+			let data: Data = match instances.instances.get(&component_id).unwrap().get(&instance_id) {
+				Some(d) => d.copy(),
+				None => Data::STRING("".to_string())
+			};
+
+			let instance = ComponentInstance {
+				instance_id: instance_id,
+				component_id: *component_id,
+				component_name: component_name.to_string(),
+				component_type: *component_type,
+				is_static_component: *is_static,
+				data: data
+			};
+			
+			model.insert(component_name.to_string(), instance);
+		}
+
+		Ok(model)
+	}
+
+	pub fn save_model(model: HashMap<String, ComponentInstance>, resource_name: &str, instance_id: usize) -> DBResult<()> {
+		let components = try!(internals::Components::load());
+		let mut instances = try!(internals::Instances::load());
+
+		for (component_name, instance) in model {
+			// get instance and update instances with data
+			let component_id = instance.component_id;
+			instances.instances.get_mut(&component_id).unwrap().insert(instance_id, instance.data);
+		}
+
+		Ok(())
+	}
+
 	/// Defines the internal workings of the database. This includes filesystems layout,
 	/// file I/O, and database design.
 	mod internals {
 		use db;
 		use std::path::Path;
-		use std::collections::{HashMap};
+		use std::collections::{HashMap, HashSet};
 		use std::fs;
 		use std::fs::{File, OpenOptions};
 		use std::io::{BufReader, ErrorKind};
@@ -152,27 +401,13 @@ mod db {
 		static COMPONENTS_FILE: &'static str = "data/components.db";
 		static INSTANCES_FILE: &'static str = "data/instances.db";
 
-		struct Resource {
-			resource_name: String,
-			resource_id: usize,
-			model: Vec<usize> // list of component ids
-		}
-
-		struct Component {
-			component_name: String,
-			component_id: usize,
-			component_type: db::TypeId,
-			is_static: bool
-		}
-
 		// structs to serialize to file
 
 		#[derive(RustcEncodable, RustcDecodable, PartialEq, Debug)]
-		struct Resources {
-			resources: HashMap<String, usize>,
-			models: HashMap<usize, Vec<usize>>,
-			next_resource_id: usize, // keeps track of resource ids
-			next_instance_type_id: usize, // keeps track of instance type ids
+		pub struct Resources {
+			pub resources: HashMap<String, (usize, bool, usize)>, // resource name : (resource id, static flag, static resource id)
+			pub models: HashMap<usize, HashSet<usize>>, // resource id : component ids
+			pub next_resource_id: usize, // keeps track of resource ids
 		}
 
 		impl Resources {
@@ -180,57 +415,58 @@ mod db {
 				Resources {
 					resources: HashMap::new(),
 					models: HashMap::new(),
-					next_resource_id: 1, // keeps track of resource ids
-					next_instance_type_id: 1, // keeps track of instance type ids
+					next_resource_id: 1,
 				}
 			}
 
-			fn load() -> db::DBResult<Resources> {
+			pub fn load() -> db::DBResult<Resources> {
 				match load_from_file::<Resources>(RESOURCES_FILE) {
 					Ok(r) => Ok(r),
 					Err(error) => Err(error)
 				}
 			}
 
-			fn save(&self) -> db::DBResult<()> {
+			pub fn save(&self) -> db::DBResult<()> {
 				save_to_file::<Resources>(RESOURCES_FILE, &self)
 			}
 		}
 
 		#[derive(RustcEncodable, RustcDecodable, PartialEq, Debug)]
-		struct Components {
-			components: HashMap<String, usize>,
-			component_types: HashMap<usize, db::TypeId>,
-			component_static_flags: HashMap<usize, bool>,
-			next_component_id: usize
+		pub struct Components {
+			pub components: HashMap<String, usize>,
+			pub component_names: HashMap<usize, String>,
+			pub component_types: HashMap<usize, db::TypeId>,
+			pub component_static_flags: HashMap<usize, bool>,
+			pub next_component_id: usize
 		}
 
 		impl Components {
 			fn new() -> Components {
 				Components {
 					components: HashMap::new(),
+					component_names: HashMap::new(),
 					component_types: HashMap::new(),
 					component_static_flags: HashMap::new(),
 					next_component_id: 0
 				}
 			}
 
-			fn load() -> db::DBResult<Components> {
+			pub fn load() -> db::DBResult<Components> {
 				match load_from_file::<Components>(COMPONENTS_FILE) {
 					Ok(r) => Ok(r),
 					Err(error) => Err(error)
 				}
 			}
 
-			fn save(&self) -> db::DBResult<()> {
+			pub fn save(&self) -> db::DBResult<()> {
 				save_to_file::<Components>(COMPONENTS_FILE, &self)
 			}
 		}
 
 		#[derive(RustcEncodable, RustcDecodable, PartialEq, Debug)]
-		struct Instances {
-			instances: HashMap<usize, HashMap<usize, db::Data>>,
-			next_instance_id: usize
+		pub struct Instances {
+			pub instances: HashMap<usize, HashMap<usize, db::Data>>, // component id : [instance id : Data]
+			pub next_instance_id: usize
 		}
 
 		impl Instances {
@@ -241,14 +477,14 @@ mod db {
 				}
 			}
 
-			fn load() -> db::DBResult<Instances> {
+			pub fn load() -> db::DBResult<Instances> {
 				match load_from_file::<Instances>(INSTANCES_FILE) {
 					Ok(r) => Ok(r),
 					Err(error) => Err(error)
 				}
 			}
 
-			fn save(&self) -> db::DBResult<()> {
+			pub fn save(&self) -> db::DBResult<()> {
 				save_to_file::<Instances>(INSTANCES_FILE, &self)
 			}
 		}
@@ -350,7 +586,7 @@ mod db {
 	}
 }
 
-
+/*
 #[test]
 fn test_setup() {
 	match db::reset() {
@@ -358,11 +594,75 @@ fn test_setup() {
 		_ => ()
 	};
 }
+*/
 
+
+fn get_model(resource_name: &str) -> HashMap<String, db::ComponentInstance> {
+	let model: HashMap<String, db::ComponentInstance> = {
+		let is_static = match db::is_static_resource("/login/") {
+			Err(error) => panic!("{:?}", error),
+			Ok(b) => b
+		};
+		if is_static {
+			// static resource, so just get the associated model
+			match db::load_static_model("/login/") {
+				Err(error) => panic!("{:?}", error),
+				Ok(model) => model
+			}
+		} else {
+			// use instance id, if applicable
+			match db::load_model("/login/", 1) {
+				Err(error) => panic!("{:?}", error),
+				Ok(model) => model
+			}
+		}
+	};
+
+	model
+}
 
 #[test]
-fn test_resources() {
-	
+fn test_database() {
+	// test admin functions
+
+	match db::reset() {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_resource("/login/", true) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_component("username", db::TypeId::STRING, true) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_component_to_model("/login/", "username", db::IOType::INPUT) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	// test API functions
+
+	let type_id = match db::get_type_id("username") {
+		Err(error) => panic!("{:?}", error),
+		Ok(type_id) => type_id
+	};
+	assert_eq!(db::TypeId::STRING, type_id);
+
+	let model1 = get_model("/login/");
+
+	match db::save_model(model1, "/login/", 1) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	let model2 = get_model("/login/");
+
+	assert!(model2.contains_key("username"));
 }
 
 
