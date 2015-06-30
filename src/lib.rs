@@ -72,14 +72,15 @@ mod db {
 	}
 
 	#[derive(RustcEncodable, RustcDecodable, Copy, Clone, Debug, PartialEq)]
-	pub enum TypeId {
+	pub enum DataType {
 		UINT,
 		INT,
-		STRING
+		STRING,
+		PASSWORD
 	}
 
-	#[derive(Debug, PartialEq)]
-	pub enum DataIOType {
+	#[derive(RustcEncodable, RustcDecodable, Copy, Clone, Debug, PartialEq)]
+	pub enum DataIO {
 		/// Data can only be read from this slot and put into a non-input element. This 
 		// field is excluded when saving so that read only data is not corrupted.
 		DB_READ_ONLY,
@@ -96,8 +97,8 @@ mod db {
 		STATIC
 	}
 
-	#[derive(RustcEncodable, RustcDecodable, Debug, PartialEq)]
-	pub enum ResourceIOType {
+	#[derive(RustcEncodable, RustcDecodable, Copy, Clone, Debug, PartialEq)]
+	pub enum ResourceIO {
 		/// A form type can create instances. This would be for resources like blog posts.
 		/// Each form resource must have an associated instance id. This is usually in the
 		/// form of an auto-generated number id, but can be overridden.
@@ -144,8 +145,8 @@ mod db {
 	pub struct ComponentInstance {
 		pub component_id: usize,
 		pub component_name: String,
-		pub component_type: TypeId,
-		pub is_static_component: bool,
+		pub component_data_type: DataType,
+		pub component_io_type: DataIO,
 		pub data: Data
 	}
 
@@ -156,16 +157,23 @@ mod db {
 		Ok(())
 	}
 
-	pub fn add_resource(resource_name: &str, resource_type: ResourceIOType) -> DBResult<()> {
+	pub fn add_resource(resource_name: &str, resource_type: ResourceIO,	instance_id: Option<usize>) -> DBResult<()> {
 		let mut resources = try!(internals::Resources::load());
 
 		// add resource definition
 		let resource_id = resources.next_resource_id;
 		resources.next_resource_id = resources.next_resource_id + 1;
 		resources.resources.insert(resource_name.to_string(), (resource_id, resource_type));
+		if instance_id != None {
+			// to have an instance id, the resource must be FORM IO
+			if resource_type != ResourceIO::FORM {
+				return Err(DatabaseError::MalformedStructure(format!("Resource is not FORM IO type: {}", resource_name)));
+			}
+			resources.resource_instances.insert(resource_id, instance_id.unwrap());
+		}
 
 		// add model definition
-		resources.models.insert(resource_id, HashSet::new());
+		resources.models.insert(resource_id, HashMap::new());
 
 		// save changes
 		try!(resources.save());
@@ -173,7 +181,7 @@ mod db {
 		Ok(())
 	}
 
-	pub fn add_component(component_name: &str, type_id: TypeId, is_static: bool) -> DBResult<()> {
+	pub fn add_component(component_name: &str, data_type: DataType) -> DBResult<()> {
 		let mut components = try!(internals::Components::load());
 
 		// add component definition
@@ -183,10 +191,7 @@ mod db {
 		components.component_names.insert(component_id, component_name.to_string());
 
 		// add type
-		components.component_types.insert(component_id, type_id);
-
-		// add static flag
-		components.component_static_flags.insert(component_id, is_static);
+		components.component_data_types.insert(component_id, data_type);
 
 		// save changes
 		try!(components.save());
@@ -194,7 +199,7 @@ mod db {
 		Ok(())
 	}
 
-	pub fn add_component_to_model(resource_name: &str, component_name: &str, io_type: DataIOType) -> DBResult<()> {
+	pub fn add_component_to_model(resource_name: &str, component_name: &str, io_type: DataIO) -> DBResult<()> {
 		let mut resources = try!(internals::Resources::load());
 		let components = try!(internals::Components::load());
 		let mut instances = try!(internals::Instances::load());
@@ -209,16 +214,15 @@ mod db {
 			return Err(DatabaseError::ComponentNotDefined(format!("Component is not defined: {}", component_name)));
 		}
 
-
 		let component_id = components.components.get(component_name).unwrap();
 		let resource_id = resources.resources.get(resource_name).unwrap().0;
 		{ // mutable scope for adding component id to resources
 			let mut model = resources.models.get_mut(&resource_id).unwrap();
-			model.insert(*component_id);
+			model.insert(*component_id, io_type);
 		}
 
-		// add component instance to instances
-		if !instances.instances.contains_key(&component_id) {
+		// add component instance to instances (if not static)
+		if io_type != DataIO::STATIC && !instances.instances.contains_key(&component_id) {
 			// if no instances defined yet for component, then insert a new one
 			instances.instances.insert(*component_id, HashMap::new());
 			try!(instances.save());		
@@ -247,9 +251,18 @@ mod db {
 		Ok(())
 	}
 
+	pub fn next_instance_id() -> DBResult<usize> {
+		let mut instances = try!(internals::Instances::load());
+		let instance_id = instances.next_instance_id;
+		instances.next_instance_id = instances.next_instance_id + 1;
+		try!(instances.save());
+
+		Ok(instance_id)
+	}
+
 	// API functions
 
-	pub fn get_type_id(component_name: &str) -> DBResult<TypeId> {
+	pub fn get_component_data_type(component_name: &str) -> DBResult<DataType> {
 		let components = try!(internals::Components::load());
 
 		// the component must exist
@@ -261,10 +274,10 @@ mod db {
 		let component_id = components.components.get(component_name).unwrap();
 
 		// get type
-		let type_id: &TypeId = components.component_types.get(&component_id).unwrap();
+		let data_type: &DataType = components.component_data_types.get(&component_id).unwrap();
 
 		// ?? done with Copy/Clone? Without Copy/Clone you cannot move this out of scope
-		Ok(*type_id)
+		Ok(*data_type)
 	}
 
 	pub fn is_static_resource(resource_name: &str) -> DBResult<bool> {
@@ -276,7 +289,7 @@ mod db {
 		}
 
 		// get static flag
-		let static_flag = (ResourceIOType::STATIC == resources.resources.get(resource_name).unwrap().1);
+		let static_flag = (ResourceIO::STATIC == resources.resources.get(resource_name).unwrap().1);
 
 		Ok(static_flag)
 	}
@@ -301,24 +314,23 @@ mod db {
 
 		// get model
 		let mut model: HashMap<String, ComponentInstance> = HashMap::new();
-		let component_ids = resources.models.get(&resource_id).unwrap();
-		for component_id in component_ids {
+		let model_component = resources.models.get(&resource_id).unwrap();
+		for (component_id, io_type) in model_component {
 			println!("Getting component");
 			// get component data
 			let component_name = components.component_names.get(&component_id).unwrap();
-			let component_type = components.component_types.get(&component_id).unwrap();
-			let is_static = components.component_static_flags.get(&component_id).unwrap();
+			let component_data_type = components.component_data_types.get(&component_id).unwrap();
 
 			// the component must be static
-			if !is_static {
+			if *io_type != DataIO::STATIC {
 				return Err(DatabaseError::MalformedStructure(format!("Component is not static: {}", resource_name)));
 			}
 
 			let instance = ComponentInstance {
 				component_id: *component_id,
 				component_name: component_name.to_string(),
-				component_type: *component_type,
-				is_static_component: *is_static,
+				component_data_type: *component_data_type,
+				component_io_type: *io_type,
 				data: Data::STRING("".to_string())
 			};
 
@@ -343,12 +355,11 @@ mod db {
 
 		// get model
 		let mut model: HashMap<String, ComponentInstance> = HashMap::new();
-		let component_ids = resources.models.get(&resource_id).unwrap();
-		for component_id in component_ids {
+		let model_components = resources.models.get(&resource_id).unwrap();
+		for (component_id, io_type) in model_components {
 			// get component data
 			let component_name = components.component_names.get(&component_id).unwrap();
-			let component_type = components.component_types.get(&component_id).unwrap();
-			let is_static = components.component_static_flags.get(&component_id).unwrap();
+			let component_data_type = components.component_data_types.get(&component_id).unwrap();
 
 			// get data
 			let data: Data = match instances.instances.get(&component_id).unwrap().get(&instance_id) {
@@ -359,8 +370,8 @@ mod db {
 			let instance = ComponentInstance {
 				component_id: *component_id,
 				component_name: component_name.to_string(),
-				component_type: *component_type,
-				is_static_component: *is_static,
+				component_data_type: *component_data_type,
+				component_io_type: *io_type,
 				data: data
 			};
 			
@@ -371,12 +382,28 @@ mod db {
 	}
 
 	pub fn save_model(model: HashMap<String, ComponentInstance>, resource_name: &str, instance_id: usize) -> DBResult<()> {
+		let resources = try!(internals::Resources::load());
 		let components = try!(internals::Components::load());
 		let mut instances = try!(internals::Instances::load());
+
+		// get resource id
+		let resource_id = resources.resources.get(resource_name).unwrap().0;
 
 		for (component_name, instance) in model {
 			// get instance and update instances with data
 			let component_id = instance.component_id;
+
+			// check the component data type
+			let component_data_type = components.component_data_types.get(&component_id).unwrap();
+			// TODO: filter here? Tainted?
+
+			// check the component io type
+			let component_io_type = resources.models.get(&resource_id).unwrap().get(&component_id).unwrap(); // io type is per resource and comes from the model
+			if *component_io_type == DataIO::DB_READ_ONLY || *component_io_type == DataIO::STATIC {
+				// do not try to save any read only or static components
+				continue;
+			}
+
 			instances.instances.get_mut(&component_id).unwrap().insert(instance_id, instance.data);
 		}
 
@@ -405,8 +432,9 @@ mod db {
 
 		#[derive(RustcEncodable, RustcDecodable, PartialEq, Debug)]
 		pub struct Resources {
-			pub resources: HashMap<String, (usize, db::ResourceIOType)>, // resource name : (resource id, static flag)
-			pub models: HashMap<usize, HashSet<usize>>, // resource id : component ids
+			pub resources: HashMap<String, (usize, db::ResourceIO)>, // resource name : (resource id, static flag)
+			pub resource_instances: HashMap<usize, usize>, // resource id : instance id
+			pub models: HashMap<usize, HashMap<usize, db::DataIO>>, // resource id : [component id : data io]
 			pub next_resource_id: usize, // keeps track of resource ids
 		}
 
@@ -414,6 +442,7 @@ mod db {
 			fn new() -> Resources {
 				Resources {
 					resources: HashMap::new(),
+					resource_instances: HashMap::new(),
 					models: HashMap::new(),
 					next_resource_id: 1,
 				}
@@ -435,8 +464,7 @@ mod db {
 		pub struct Components {
 			pub components: HashMap<String, usize>,
 			pub component_names: HashMap<usize, String>,
-			pub component_types: HashMap<usize, db::TypeId>,
-			pub component_static_flags: HashMap<usize, bool>,
+			pub component_data_types: HashMap<usize, db::DataType>,
 			pub next_component_id: usize
 		}
 
@@ -445,8 +473,7 @@ mod db {
 				Components {
 					components: HashMap::new(),
 					component_names: HashMap::new(),
-					component_types: HashMap::new(),
-					component_static_flags: HashMap::new(),
+					component_data_types: HashMap::new(),
 					next_component_id: 0
 				}
 			}
@@ -640,28 +667,64 @@ fn test_database() {
 		_ => ()
 	};
 
-	match db::add_resource("/login/", db::ResourceIOType::STATIC) {
+	match db::add_resource("/login/", db::ResourceIO::STATIC, None) {
 		Err(error) => panic!("{:?}", error),
 		_ => ()
 	};
 
-	match db::add_component("username", db::TypeId::STRING, true) {
+	let blog_post_instance_id = match db::next_instance_id() {
+		Err(error) => panic!("{:?}", error),
+		Ok(id) => id
+	};
+
+	match db::add_resource("/blog/username/my_first_post/", db::ResourceIO::FORM, Some(blog_post_instance_id)) {
 		Err(error) => panic!("{:?}", error),
 		_ => ()
 	};
 
-	match db::add_component_to_model("/login/", "username", db::DataIOType::DB_INPUT) {
+	match db::add_component("blogpost", db::DataType::STRING) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_component("username", db::DataType::STRING) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_component("password", db::DataType::PASSWORD) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_component_to_model("/login/", "username", db::DataIO::STATIC) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_component_to_model("/login/", "password", db::DataIO::STATIC) {
+		Err(error) => panic!("{:?}", error),
+		_ => ()
+	};
+
+	match db::add_component_to_model("/blog/username/my_first_post/", "blogpost", db::DataIO::DB_READ_ONLY) {
 		Err(error) => panic!("{:?}", error),
 		_ => ()
 	};
 
 	// test API functions
 
-	let type_id = match db::get_type_id("username") {
+	let data_type1 = match db::get_component_data_type("username") {
 		Err(error) => panic!("{:?}", error),
-		Ok(type_id) => type_id
+		Ok(data_type) => data_type
 	};
-	assert_eq!(db::TypeId::STRING, type_id);
+	assert_eq!(db::DataType::STRING, data_type1);
+
+	let data_type2 = match db::get_component_data_type("password") {
+		Err(error) => panic!("{:?}", error),
+		Ok(data_type) => data_type
+	};
+	assert_eq!(db::DataType::PASSWORD, data_type2);
 
 	let model1 = get_model("/login/");
 
@@ -689,7 +752,21 @@ fn test_database() {
 			Ok(model) => model
 		};
 	}
+
 	// test form resource
+	{
+		let is_static = match db::is_static_resource("/blog/username/my_first_post/") {
+			Err(error) => panic!("{:?}", error),
+			Ok(b) => b
+		};
+		assert!(!is_static);
+
+		// get the associated model
+		match db::load_model("/blog/username/my_first_post/", blog_post_instance_id) {
+			Err(error) => panic!("{:?}", error),
+			Ok(model) => model
+		};
+	}
 
 
 	// test input data
