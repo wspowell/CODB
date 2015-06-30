@@ -78,11 +78,35 @@ mod db {
 		STRING
 	}
 
-	#[derive(Debug)]
-	pub enum IOType {
-		OUTPUT,
-		INPUT,
-		BOTH
+	#[derive(Debug, PartialEq)]
+	pub enum DataIOType {
+		/// Data can only be read from this slot and put into a non-input element. This 
+		// field is excluded when saving so that read only data is not corrupted.
+		DB_READ_ONLY,
+		/// Data can only be written into this slot. It cannot be inserted into a non-input
+		/// form element. The reasoning is to make a clear definition between showing 
+		/// data and inputting/updating data.
+		DB_INPUT,
+		/// Data can be put into non-input and input form elements. Unlike read only fields,
+		/// this data will be included when saving.
+		DB_BOTH,
+		/// This indicates a field that is not tied to a database location, but is included
+		/// for the purpose of data processing. Example, a username/password on a login page
+		/// is not tied to a database location, but it is used to authenticate a user.
+		STATIC
+	}
+
+	#[derive(RustcEncodable, RustcDecodable, Debug, PartialEq)]
+	pub enum ResourceIOType {
+		/// A form type can create instances. This would be for resources like blog posts.
+		/// Each form resource must have an associated instance id. This is usually in the
+		/// form of an auto-generated number id, but can be overridden.
+		FORM,
+		/// A static page has no instances. It is a single page that does not handle data
+		/// submission. An example would be a login page. Any static resource that submits
+		/// information is required to have a data processing subroutine defined. Saving
+		/// a static resource will result in an error.
+		STATIC
 	}
 
 	pub struct Tainted {
@@ -118,7 +142,6 @@ mod db {
 
 	#[derive(Debug, PartialEq)]
 	pub struct ComponentInstance {
-		pub instance_id: usize,
 		pub component_id: usize,
 		pub component_name: String,
 		pub component_type: TypeId,
@@ -133,18 +156,13 @@ mod db {
 		Ok(())
 	}
 
-	pub fn add_resource(resource_name: &str, is_static: bool) -> DBResult<()> {
+	pub fn add_resource(resource_name: &str, resource_type: ResourceIOType) -> DBResult<()> {
 		let mut resources = try!(internals::Resources::load());
-		let mut instances = try!(internals::Instances::load());
-
-		let instance_id = instances.next_instance_id;
-		instances.next_instance_id = instances.next_instance_id + 1;
-		try!(instances.save());
 
 		// add resource definition
 		let resource_id = resources.next_resource_id;
 		resources.next_resource_id = resources.next_resource_id + 1;
-		resources.resources.insert(resource_name.to_string(), (resource_id, is_static, instance_id));
+		resources.resources.insert(resource_name.to_string(), (resource_id, resource_type));
 
 		// add model definition
 		resources.models.insert(resource_id, HashSet::new());
@@ -176,7 +194,7 @@ mod db {
 		Ok(())
 	}
 
-	pub fn add_component_to_model(resource_name: &str, component_name: &str, io_type: IOType) -> DBResult<()> {
+	pub fn add_component_to_model(resource_name: &str, component_name: &str, io_type: DataIOType) -> DBResult<()> {
 		let mut resources = try!(internals::Resources::load());
 		let components = try!(internals::Components::load());
 		let mut instances = try!(internals::Instances::load());
@@ -258,7 +276,7 @@ mod db {
 		}
 
 		// get static flag
-		let static_flag = resources.resources.get(resource_name).unwrap().1;
+		let static_flag = (ResourceIOType::STATIC == resources.resources.get(resource_name).unwrap().1);
 
 		Ok(static_flag)
 	}
@@ -280,7 +298,6 @@ mod db {
 
 		// get resource id
 		let resource_id = resources.resources.get(resource_name).unwrap().0;
-		let static_resource_instance_id = resources.resources.get(resource_name).unwrap().2;
 
 		// get model
 		let mut model: HashMap<String, ComponentInstance> = HashMap::new();
@@ -291,34 +308,18 @@ mod db {
 			let component_name = components.component_names.get(&component_id).unwrap();
 			let component_type = components.component_types.get(&component_id).unwrap();
 			let is_static = components.component_static_flags.get(&component_id).unwrap();
-			println!("Getting component data");
-			// get data
-			let data: Data = {
-				// instance data for component must exist
-				if !instances.instances.contains_key(&component_id) {
-					return Err(DatabaseError::InstanceNotDefined(format!("Instance is not defined for component: {}", component_name)));
-				}
-				println!("Checking");
-				// check if component data exists
-				if !instances.instances.get(&component_id).unwrap().contains_key(&static_resource_instance_id) {
-					println!("No data");
-					Data::STRING("".to_string())
-				} else {
-					println!("Has data");
-					match instances.instances.get(&component_id).unwrap().get(&static_resource_instance_id) {
-						Some(d) => d.copy(),
-						None => Data::STRING("".to_string())
-					}
-				}
-			};
+
+			// the component must be static
+			if !is_static {
+				return Err(DatabaseError::MalformedStructure(format!("Component is not static: {}", resource_name)));
+			}
 
 			let instance = ComponentInstance {
-				instance_id: static_resource_instance_id,
 				component_id: *component_id,
 				component_name: component_name.to_string(),
 				component_type: *component_type,
 				is_static_component: *is_static,
-				data: data
+				data: Data::STRING("".to_string())
 			};
 
 			model.insert(component_name.to_string(), instance);
@@ -356,7 +357,6 @@ mod db {
 			};
 
 			let instance = ComponentInstance {
-				instance_id: instance_id,
 				component_id: *component_id,
 				component_name: component_name.to_string(),
 				component_type: *component_type,
@@ -405,7 +405,7 @@ mod db {
 
 		#[derive(RustcEncodable, RustcDecodable, PartialEq, Debug)]
 		pub struct Resources {
-			pub resources: HashMap<String, (usize, bool, usize)>, // resource name : (resource id, static flag, static resource id)
+			pub resources: HashMap<String, (usize, db::ResourceIOType)>, // resource name : (resource id, static flag)
 			pub models: HashMap<usize, HashSet<usize>>, // resource id : component ids
 			pub next_resource_id: usize, // keeps track of resource ids
 		}
@@ -597,6 +597,16 @@ fn test_setup() {
 */
 
 
+/// A static resource means that there is only one instance (copy) of that resource. This means
+/// that it can only hold static components.
+
+/// A static component means that there is only one instance of it.
+/// Types of IO: DBInput, DBReadOnly, DBBoth, and Static
+/// DB types reference a specific data slot in the database where information is stored. A static 
+/// type is a field that is only there for data processing, such as username and password on
+/// a login page. DB types are only allowed on non-static resources.
+
+
 fn get_model(resource_name: &str) -> HashMap<String, db::ComponentInstance> {
 	let model: HashMap<String, db::ComponentInstance> = {
 		let is_static = match db::is_static_resource("/login/") {
@@ -630,7 +640,7 @@ fn test_database() {
 		_ => ()
 	};
 
-	match db::add_resource("/login/", true) {
+	match db::add_resource("/login/", db::ResourceIOType::STATIC) {
 		Err(error) => panic!("{:?}", error),
 		_ => ()
 	};
@@ -640,7 +650,7 @@ fn test_database() {
 		_ => ()
 	};
 
-	match db::add_component_to_model("/login/", "username", db::IOType::INPUT) {
+	match db::add_component_to_model("/login/", "username", db::DataIOType::DB_INPUT) {
 		Err(error) => panic!("{:?}", error),
 		_ => ()
 	};
@@ -663,6 +673,35 @@ fn test_database() {
 	let model2 = get_model("/login/");
 
 	assert!(model2.contains_key("username"));
+
+
+	// test static resource
+	{
+		let is_static = match db::is_static_resource("/login/") {
+			Err(error) => panic!("{:?}", error),
+			Ok(b) => b
+		};
+		assert!(is_static);
+
+		// static resource, so just get the associated model
+		match db::load_static_model("/login/") {
+			Err(error) => panic!("{:?}", error),
+			Ok(model) => model
+		};
+	}
+	// test form resource
+
+
+	// test input data
+
+
+	// test read only data
+
+
+	// test input and read only data
+
+
+	// test static data	
 }
 
 
