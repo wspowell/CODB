@@ -1,5 +1,5 @@
 [package]
-name = "CODB"
+name = "codb"
 version = "0.1.0"
 authors = ["Wesley Powell <wspowell@utexas.edu>"]
 
